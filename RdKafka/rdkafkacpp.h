@@ -108,6 +108,7 @@ enum ErrorCode {
   /* Standard Kafka errors: */
   ERR_UNKNOWN = -1,
   ERR_NO_ERROR = 0,
+  OK = ERR_NO_ERROR,
   ERR_OFFSET_OUT_OF_RANGE = 1,
   ERR_INVALID_MSG = 2,
   ERR_UNKNOWN_TOPIC_OR_PART = 3,
@@ -389,6 +390,11 @@ class Topic {
    * Returns RD_KAFKA_RESP_ERR_NO_ERROR on success or an error code on error.
    */
   virtual ErrorCode offset_store (int32_t partition, int64_t offset) = 0;
+
+  /**
+   * Same as offset_store () above but takes a Message object.
+   */
+  virtual ErrorCode offset_store (const Message *message) = 0;
 };
 
 

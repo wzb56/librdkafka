@@ -280,6 +280,11 @@ class TopicImpl : public Topic {
         rd_kafka_offset_store(rkt_, partition, offset));
   }
 
+  ErrorCode offset_store (const Message *message) {
+    return this->offset_store(message->partition(), message->offset());
+  }
+
+
   static Topic *create (Handle &base, const std::string &topic,
                         Conf *conf);
 

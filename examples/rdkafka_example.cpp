@@ -60,7 +60,7 @@ static void sigterm (int sig) {
 class ExampleDeliveryReportCb : public RdKafka::DeliveryReportCb {
  public:
   void dr_cb (RdKafka::Message &message) {
-    std::cout << "Message delivery for (" << message.len() << " bytes): " <<
+    std::cerr << "Message delivery for (" << message.len() << " bytes): " <<
         message.errstr() << std::endl;
   }
 };
@@ -341,7 +341,7 @@ int main (int argc, char **argv) {
       exit(1);
     }
 
-    std::cout << "% Created producer " << producer->name() << std::endl;
+    std::cerr << "% Created producer " << producer->name() << std::endl;
 
     /*
      * Create topic handle.
@@ -404,7 +404,7 @@ int main (int argc, char **argv) {
       exit(1);
     }
 
-    std::cout << "% Created consumer " << consumer->name() << std::endl;
+    std::cerr << "% Created consumer " << consumer->name() << std::endl;
 
     /*
      * Create topic handle.
