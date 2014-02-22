@@ -23,7 +23,8 @@ log_level                                |             6 | Logging level (syslog
 socket_cb                                |               | Socket creation callback to provide race-free CLOEXEC
 open_cb                                  |               | File open callback to provide race-free CLOEXEC
 opaque                                   |               | Application opaque (set with rd_kafka_conf_set_opaque())
-queued.min.messages                      |        100000 | Minimum number of messages that should to be available for consumption by application.
+queued.min.messages                      |        100000 | Minimum number of messages per topic+partition in the local consumer queue.
+queued.max.messages.kbytes               |       1000000 | Maximum number of kilobytes per topic+partition in the local consumer queue. This value may be overshot by fetch.message.max.bytes.
 fetch.wait.max.ms                        |           100 | Maximum time the broker may wait to fill the response with fetch.min.bytes.
 fetch.message.max.bytes                  |       1048576 | Maximum number of bytes per topic+partition to request when fetching messages from the broker.
 fetch.min.bytes                          |             1 | Minimum number of bytes the broker responds with. If fetch.wait.max.ms expires the accumulated data will be sent to the client regardless of this setting.
