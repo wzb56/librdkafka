@@ -18,6 +18,10 @@ broker.address.ttl                       |        300000 | How long to cache the
 statistics.interval.ms                   |             0 | librdkafka statistics emit interval. The application also needs to register a stats callback using `rd_kafka_conf_set_stats_cb()`. The granularity is 1000ms. A value of 0 disables statistics.
 error_cb                                 |               | Error callback (set with rd_kafka_conf_set_error_cb())
 stats_cb                                 |               | Statistics callback (set with rd_kafka_conf_set_stats_cb())
+log_cb                                   |               | Log callback (set with rd_kafka_conf_set_log_cb())
+log_level                                |             6 | Logging level (syslog(3) levels)
+socket_cb                                |               | Socket creation callback to provide race-free CLOEXEC
+open_cb                                  |               | File open callback to provide race-free CLOEXEC
 opaque                                   |               | Application opaque (set with rd_kafka_conf_set_opaque())
 queued.min.messages                      |        100000 | Minimum number of messages that should to be available for consumption by application.
 fetch.wait.max.ms                        |           100 | Maximum time the broker may wait to fill the response with fetch.min.bytes.
@@ -31,6 +35,7 @@ retry.backoff.ms                         |           100 | The backoff time in m
 compression.codec                        |          none | Compression codec to use for compressing message sets: none, gzip or snappy
 batch.num.messages                       |          1000 | Maximum number of messages batched in one MessageSet.
 dr_cb                                    |               | Delivery report callback (set with rd_kafka_conf_set_dr_cb())
+dr_msg_cb                                |               | Delivery report callback (set with rd_kafka_conf_set_dr_msg_cb())
 
 
 ## Topic configuration properties
