@@ -394,7 +394,7 @@ static void rd_kafka_broker_waitresp_timeout_scan (rd_kafka_broker_t *rkb,
 	rd_kafka_buf_t *rkbuf, *tmp;
 	int cnt = 0;
 
-	rd_kafka_assert(rkb->rkb_rk, pthread_self() == rkb->rkb_thread);
+	assert(pthread_self() == rkb->rkb_thread);
 
 	TAILQ_FOREACH_SAFE(rkbuf,
 			   &rkb->rkb_waitresps.rkbq_bufs, rkbuf_link, tmp) {
@@ -417,7 +417,7 @@ static void rd_kafka_broker_waitresp_timeout_scan (rd_kafka_broker_t *rkb,
                 rkb->rkb_c.req_timeouts += cnt;
 
                 if (rkb->rkb_rk->rk_conf.socket_max_fails &&
-                    rkb->rkb_req_timeouts >
+                    rkb->rkb_req_timeouts >=
                     rkb->rkb_rk->rk_conf.socket_max_fails &&
                     rkb->rkb_state == RD_KAFKA_BROKER_STATE_UP) {
                         errno = ETIMEDOUT;

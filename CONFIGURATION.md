@@ -15,7 +15,7 @@ socket.timeout.ms                        |         60000 | Timeout for network r
 socket.send.buffer.bytes                 |             0 | Broker socket send buffer size. System default is used if 0.
 socket.receive.buffer.bytes              |             0 | Broker socket receive buffer size. System default is used if 0.
 socket.keepalive.enable                  |         false | Enable TCP keep-alives (SO_KEEPALIVE) on broker sockets
-socket.max.fails                         |             0 | Maximum number of send failures (e.g., timed out requests) before disconnecting from the broker and reconnecting. Disable with 0.
+socket.max.fails                         |             0 | Disconnect from broker when this number of send failures (e.g., timed out requests) is reached. Disable with 0. NOTE: The connection is automatically re-established.
 broker.address.ttl                       |        300000 | How long to cache the broker address resolving results.
 statistics.interval.ms                   |             0 | librdkafka statistics emit interval. The application also needs to register a stats callback using `rd_kafka_conf_set_stats_cb()`. The granularity is 1000ms. A value of 0 disables statistics.
 error_cb                                 |               | Error callback (set with rd_kafka_conf_set_error_cb())
