@@ -26,6 +26,8 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
+#pragma once
+
 /**
  * Apache Kafka consumer & producer
  *
@@ -59,7 +61,7 @@ namespace RdKafka {
  *
  * I.e.: 0x00080100 = 0.8.1
  */
-#define RD_KAFKA_VERSION  0x00080300
+#define RD_KAFKA_VERSION  0x00080600
 
 /**
  * Returns the librdkafka version as integer.
@@ -104,6 +106,7 @@ enum ErrorCode {
   ERR__TIMED_OUT = -185,         /* Operation timed out */
   ERR__QUEUE_FULL = -184,        /* Queue is full */
   ERR__ISR_INSUFF = -183,        /* ISR count < required.acks */
+  ERR__NODE_UPDATE = -182,       /* Broker node update */
   ERR__END = -100,               /* end internal error codes */
 
   /* Standard Kafka errors: */
@@ -120,7 +123,10 @@ enum ErrorCode {
   ERR_REPLICA_NOT_AVAILABLE = 9,
   ERR_MSG_SIZE_TOO_LARGE = 10,
   ERR_STALE_CTRL_EPOCH = 11,
-  ERR_OFFSET_METADATA_TOO_LARGE = 12
+  ERR_OFFSET_METADATA_TOO_LARGE = 12,
+  ERR_OFFSETS_LOAD_IN_PROGRESS = 14,
+  ERR_CONSUMER_COORDINATOR_NOT_AVAILABLE = 15,
+  ERR_NOT_COORDINATOR_FOR_CONSUMER = 16
 };
 
 
@@ -167,6 +173,19 @@ class PartitionerCb {
                                   void *msg_opaque) = 0;
 };
 
+/**
+ * Variant partitioner callback that gets the key as pointer and length
+ * instead of as a const std::string *.
+ */
+class PartitionerKeyPointerCb {
+ public:
+  virtual int32_t partitioner_cb (const Topic *topic,
+                                  const void *key,
+                                  size_t key_len,
+                                  int32_t partition_cnt,
+                                  void *msg_opaque) = 0;
+};
+
 
 /**
  * SocketCb callback class
@@ -193,6 +212,15 @@ class OpenCb {
 class EventCb {
  public:
   virtual void event_cb (Event &event) = 0;
+};
+
+
+/**
+ * Consume callback class
+ */
+class ConsumeCb {
+ public:
+  virtual void consume_cb (Message &message, void *opaque) = 0;
 };
 
 
@@ -281,6 +309,11 @@ class Conf {
                                 PartitionerCb *partitioner_cb,
                                 std::string &errstr) = 0;
 
+  /* Use with 'name' = "partitioner_key_pointer_cb" */
+  virtual Conf::ConfResult set (const std::string &name,
+                                PartitionerKeyPointerCb *partitioner_kp_cb,
+                                std::string &errstr) = 0;
+
   /* Use with 'name' = "socket_cb" */
   virtual Conf::ConfResult set (const std::string &name, SocketCb *socket_cb,
                                 std::string &errstr) = 0;
@@ -361,6 +394,7 @@ class Topic {
    *
    * 'conf' is an optional configuration for the topic  that will be used 
    * instead of the default topic configuration.
+   * The 'conf' object is reusable after this call.
    *
    * Returns the new topic handle or NULL on error (see `errstr`).
    */
@@ -407,6 +441,8 @@ class Message {
   virtual void               *payload () const = 0 ;
   virtual size_t              len () const = 0;
   virtual const std::string  *key () const = 0;
+  virtual const void         *key_pointer () const = 0 ;
+  virtual size_t              key_len () const = 0;
   virtual int64_t             offset () const = 0;
   virtual void               *msg_opaque () const = 0;
   virtual ~Message () = 0;
@@ -425,6 +461,7 @@ class Consumer : public virtual Handle {
    *
    * 'conf' is an optional object that will be used instead of the default
    * configuration.
+   * The 'conf' object is reusable after this call.
    *
    * Returns the new handle on success or NULL on error in which case
    * 'errstr' is set to a human readable error message.
@@ -483,10 +520,34 @@ class Consumer : public virtual Handle {
    *
    * Errors (in Message->err()):
    *   ERR__TIMED_OUT - 'timeout_ms' was reached with no new messages fetched.
+   *   ERR__PARTITION_EOF - End of partition reached, not an error.
    */
   virtual Message *consume (Topic *topic, int32_t partition,
                             int timeout_ms) = 0;
 
+  /**
+   * Consumes messages from 'topic' and 'partition', calling
+   * the provided callback for each consumed messsage.
+   *
+   * `consume_callback()` provides higher throughput performance
+   * than `consume()`.
+   *
+   * 'timeout_ms' is the maximum amount of time to wait for one or more messages
+   * to arrive.
+   *
+   * The provided 'consume_cb' instance has its 'consume_cb' function
+   * called for every message received.
+   *
+   * The 'opaque' argument is passed to the 'consume_cb' as 'opaque'.
+   *
+   * Returns the number of messages processed or -1 on error.
+   *
+   * See: consume()
+   */
+  virtual int consume_callback (Topic *topic, int32_t partition,
+                                int timeout_ms,
+                                ConsumeCb *consume_cb,
+                                void *opaque) = 0;
 };
 
 
@@ -500,6 +561,7 @@ class Producer : public virtual Handle {
    *
    * 'conf' is an optional object that will be used instead of the default
    * configuration.
+   * The 'conf' object is reusable after this call.
    *
    * Returns the new handle on success or NULL on error in which case
    * 'errstr' is set to a human readable error message.
@@ -510,8 +572,13 @@ class Producer : public virtual Handle {
   virtual ~Producer () = 0;
 
   /* Produce msgflags */
-  static const int MSG_FREE = 0x1;
-  static const int MSG_COPY = 0x2;
+  static const int RK_MSG_FREE = 0x1;
+  static const int RK_MSG_COPY = 0x2;
+  /* For backwards compatibility: */
+#ifndef MSG_COPY /* defined in sys/msg.h */
+  static const int MSG_FREE = RK_MSG_FREE;
+  static const int MSG_COPY = RK_MSG_COPY;
+#endif
 
   /**
    * Produce and send a single message to broker.
@@ -524,12 +591,16 @@ class Producer : public virtual Handle {
    *   - a fixed partition (0..N)
    *
    * 'msgflags' is zero or more of the following flags OR:ed together:
-   *    MSG_FREE - rdkafka will free(3) 'payload' when it is done with it.
-   *    MSG_COPY - the 'payload' data will be copied and the 'payload'
+   *    RK_MSG_FREE - rdkafka will free(3) 'payload' when it is done with it.
+   *    RK_MSG_COPY - the 'payload' data will be copied and the 'payload'
    *               pointer will not be used by rdkafka after the
    *               call returns.
    *
-   *  NOTE: MSG_FREE and MSG_COPY are mutually exclusive.
+   *  NOTE: RK_MSG_FREE and RK_MSG_COPY are mutually exclusive.
+   *
+   *  If the function returns -1 and RK_MSG_FREE was specified, then
+   *  the memory associated with the payload is still the caller's
+   *  responsibility.
    *
    * 'payload' is the message payload of size 'len' bytes.
    *
@@ -557,6 +628,16 @@ class Producer : public virtual Handle {
                              int msgflags,
                              void *payload, size_t len,
                              const std::string *key,
+                             void *msg_opaque) = 0;
+
+  /**
+   * Variant produce() that passes the key as a pointer and length
+   * instead of as a const std::string *.
+   */
+  virtual ErrorCode produce (Topic *topic, int32_t partition,
+                             int msgflags,
+                             void *payload, size_t len,
+                             const void *key, size_t key_len,
                              void *msg_opaque) = 0;
 };
 

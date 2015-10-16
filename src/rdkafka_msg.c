@@ -30,6 +30,7 @@
 #include "rdkafka_int.h"
 #include "rdkafka_msg.h"
 #include "rdkafka_topic.h"
+#include "rdcrc32.h"
 #include "rdrand.h"
 #include "rdtime.h"
 
@@ -40,7 +41,7 @@ void rd_kafka_msg_destroy (rd_kafka_t *rk, rd_kafka_msg_t *rkm) {
 	rd_kafka_assert(rk, rk->rk_producer.msg_cnt > 0);
 	(void)rd_atomic_sub(&rk->rk_producer.msg_cnt, 1);
 
-	if (rkm->rkm_flags & RD_KAFKA_MSG_F_FREE)
+	if (rkm->rkm_flags & RD_KAFKA_MSG_F_FREE && rkm->rkm_payload)
 		free(rkm->rkm_payload);
 
 	if (rkm->rkm_key)
@@ -66,6 +67,9 @@ static rd_kafka_msg_t *rd_kafka_msg_new0 (rd_kafka_topic_t *rkt,
 	rd_kafka_msg_t *rkm;
 	size_t mlen = sizeof(*rkm);
 
+	if (!payload) len = 0;
+	if (!key) keylen = 0;
+
 	if (unlikely(len + keylen > rkt->rkt_rk->rk_conf.max_msg_size)) {
                 *errp = RD_KAFKA_RESP_ERR_MSG_SIZE_TOO_LARGE;
                 errno = EMSGSIZE;
@@ -86,6 +90,7 @@ static rd_kafka_msg_t *rd_kafka_msg_new0 (rd_kafka_topic_t *rkt,
 	rkm->rkm_opaque     = msg_opaque;
 	rkm->rkm_key        = rd_kafkap_bytes_new(key, keylen);
 	rkm->rkm_partition  = force_partition;
+        rkm->rkm_offset     = 0;
 	if (rkt->rkt_conf.message_timeout_ms == 0) {
 		rkm->rkm_ts_timeout = INT64_MAX;
 	} else {
@@ -93,7 +98,7 @@ static rd_kafka_msg_t *rd_kafka_msg_new0 (rd_kafka_topic_t *rkt,
 			rkt->rkt_conf.message_timeout_ms * 1000;
 	}
 
-	if (msgflags & RD_KAFKA_MSG_F_COPY) {
+	if (payload && msgflags & RD_KAFKA_MSG_F_COPY) {
 		/* Copy payload to space following the ..msg_t */
 		rkm->rkm_payload = (void *)(rkm+1);
 		memcpy(rkm->rkm_payload, payload, len);
@@ -112,6 +117,10 @@ static rd_kafka_msg_t *rd_kafka_msg_new0 (rd_kafka_topic_t *rkt,
  *          into on the selected partition.
  *
  * Returns 0 on success or -1 on error.
+ *
+ * If the function returns -1 and RD_KAFKA_MSG_F_FREE was specified, then
+ * the memory associated with the payload is still the caller's
+ * responsibility.
  */
 int rd_kafka_msg_new (rd_kafka_topic_t *rkt, int32_t force_partition,
 		      int msgflags,
@@ -146,8 +155,11 @@ int rd_kafka_msg_new (rd_kafka_topic_t *rkt, int32_t force_partition,
 
 	/* Handle partitioner failures: it only fails when the application
 	 * attempts to force a destination partition that does not exist
-	 * in the cluster. */
+	 * in the cluster.  Note we must clear the RD_KAFKA_MSG_F_FREE
+	 * flag since our contract says we don't free the payload on
+	 * failure. */
 
+	rkm->rkm_flags &= ~RD_KAFKA_MSG_F_FREE;
 	rd_kafka_msg_destroy(rkt->rkt_rk, rkm);
 
 	/* Translate error codes to errnos. */
@@ -180,15 +192,9 @@ int rd_kafka_produce_batch (rd_kafka_topic_t *rkt, int32_t partition,
         rd_kafka_resp_err_t all_err = 0;
 
         /* For partitioner; hold lock for entire run,
-         * for one partition: release it after toppar lookup. */
-        rd_kafka_topic_rdlock(rkt);
-
-        /* If not using partitioner, get the toppar right away. */
-        if (partition != RD_KAFKA_PARTITION_UA) {
-                rktp = rd_kafka_toppar_get_avail(rkt, partition,
-                                                 1/*ua on miss*/, &all_err);
-                rd_kafka_topic_unlock(rkt);
-        }
+         * for one partition: only acquire when needed at the end. */
+	if (partition == RD_KAFKA_PARTITION_UA)
+		rd_kafka_topic_rdlock(rkt);
 
         for (i = 0 ; i < message_cnt ; i++) {
                 rd_kafka_msg_t *rkm;
@@ -255,9 +261,13 @@ int rd_kafka_produce_batch (rd_kafka_topic_t *rkt, int32_t partition,
         }
 
 
-        if (partition == RD_KAFKA_PARTITION_UA)
-                rd_kafka_topic_unlock(rkt);
-        else {
+
+	/* Specific partition */
+        if (partition != RD_KAFKA_PARTITION_UA) {
+		rd_kafka_topic_rdlock(rkt);
+
+                rktp = rd_kafka_toppar_get_avail(rkt, partition,
+                                                 1/*ua on miss*/, &all_err);
                 /* Concatenate tmpq onto partition queue. */
                 if (likely(rktp != NULL)) {
                         if (good > 0)
@@ -269,6 +279,8 @@ int rd_kafka_produce_batch (rd_kafka_topic_t *rkt, int32_t partition,
                         rd_kafka_toppar_destroy(rktp);
                 }
         }
+
+	rd_kafka_topic_unlock(rkt);
 
         return good;
 }
@@ -310,6 +322,15 @@ int32_t rd_kafka_msg_partitioner_random (const rd_kafka_topic_t *rkt,
 	else
 		return p;
 }
+
+int32_t rd_kafka_msg_partitioner_consistent (const rd_kafka_topic_t *rkt,
+					 const void *key, size_t keylen,
+					 int32_t partition_cnt,
+					 void *rkt_opaque,
+					 void *msg_opaque) {
+    return rd_crc32(key, keylen) % partition_cnt;
+}
+
 
 /**
  * Assigns a message to a topic partition using a partitioner.
@@ -397,6 +418,10 @@ int rd_kafka_msg_partitioner (rd_kafka_topic_t *rkt, rd_kafka_msg_t *rkm,
 	}
 
         (void)rd_atomic_add(&rktp_new->rktp_c.msgs, 1);
+
+        /* Update message partition */
+        if (rkm->rkm_partition == RD_KAFKA_PARTITION_UA)
+                rkm->rkm_partition = partition;
 
 	/* Partition is available: enqueue msg on partition's queue */
 	rd_kafka_toppar_enq_msg(rktp_new, rkm);

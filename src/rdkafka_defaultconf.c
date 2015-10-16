@@ -98,7 +98,7 @@ static const struct rd_kafka_property rd_kafka_properties[] = {
 	  "Topic metadata refresh interval in milliseconds. "
 	  "The metadata is automatically refreshed on error and connect. "
 	  "Use -1 to disable the intervalled refresh.",
-	  -1, 3600*1000, 10*1000 },
+	  -1, 3600*1000, 10*60*1000 },
 	{ _RK_GLOBAL, "topic.metadata.refresh.fast.cnt", _RK_C_INT,
 	  _RK(metadata_refresh_fast_cnt),
 	  "When a topic looses its leader this number of metadata requests "
@@ -110,6 +110,10 @@ static const struct rd_kafka_property rd_kafka_properties[] = {
 	  _RK(metadata_refresh_fast_interval_ms),
 	  "See `topic.metadata.refresh.fast.cnt` description",
 	  1, 60*1000, 250 },
+        { _RK_GLOBAL, "topic.metadata.refresh.sparse", _RK_C_BOOL,
+          _RK(metadata_refresh_sparse),
+          "Sparse metadata requests (consumes less network bandwidth)",
+          0, 1, 0 },
 	{ _RK_GLOBAL, "debug", _RK_C_S2F, _RK(debug),
 	  "A comma-separated list of debug contexts to enable: "
 	  RD_KAFKA_DEBUG_CONTEXTS,
@@ -121,6 +125,7 @@ static const struct rd_kafka_property rd_kafka_properties[] = {
 			{ RD_KAFKA_DBG_PRODUCER, "producer" },
 			{ RD_KAFKA_DBG_QUEUE,    "queue" },
 			{ RD_KAFKA_DBG_MSG,      "msg" },
+			{ RD_KAFKA_DBG_PROTOCOL, "protocol" },
 			{ RD_KAFKA_DBG_ALL,      "all" },
 		} },
 	{ _RK_GLOBAL, "socket.timeout.ms", _RK_C_INT, _RK(socket_timeout_ms),
@@ -200,6 +205,16 @@ static const struct rd_kafka_property rd_kafka_properties[] = {
 	{ _RK_GLOBAL, "opaque", _RK_C_PTR,
 	  _RK(opaque),
 	  "Application opaque (set with rd_kafka_conf_set_opaque())" },
+	{ _RK_GLOBAL, "internal.termination.signal", _RK_C_INT,
+	  _RK(term_sig),
+	  "Signal that librdkafka will use to quickly terminate on "
+	  "rd_kafka_destroy(). If this signal is not set then there will be a "
+	  "delay before rd_kafka_wait_destroyed() returns true "
+	  "as internal threads are timing out their system calls. "
+	  "If this signal is set however the delay will be minimal. "
+	  "The application should mask this signal as an internal "
+	  "signal handler is installed.",
+	  0, 128, 0 },
 
 	/* Global consumer properties */
 	{ _RK_GLOBAL|_RK_CONSUMER, "queued.min.messages", _RK_C_INT,
@@ -233,7 +248,7 @@ static const struct rd_kafka_property rd_kafka_properties[] = {
 	  _RK(fetch_error_backoff_ms),
 	  "How long to postpone the next fetch request for a "
 	  "topic+partition in case of a fetch error.",
-	  1, 300*1000, 500 },
+	  0, 300*1000, 500 },
         { _RK_GLOBAL|_RK_CONSUMER, "group.id", _RK_C_STR,
           _RK(group_id_str),
           "Consumer group id string. All clients sharing the same group.id "
@@ -255,7 +270,7 @@ static const struct rd_kafka_property rd_kafka_properties[] = {
 	  _RK(max_retries),
 	  "How many times to retry sending a failing MessageSet. "
 	  "**Note:** retrying may cause reordering.",
-	  0, 100, 2 },
+	  0, 10000000, 2 },
 	{ _RK_GLOBAL|_RK_PRODUCER, "retry.backoff.ms", _RK_C_INT,
 	  _RK(retry_backoff_ms),
 	  "The backoff time in milliseconds before retrying a message send.",
@@ -274,6 +289,10 @@ static const struct rd_kafka_property rd_kafka_properties[] = {
 	  _RK(batch_num_messages),
 	  "Maximum number of messages batched in one MessageSet.",
 	  1, 1000000, 1000 },
+	{ _RK_GLOBAL|_RK_PRODUCER, "delivery.report.only.error", _RK_C_BOOL,
+	  _RK(dr_err_only),
+	  "Only provide delivery reports for failed messages.",
+	  0, 1, 0 },
 	{ _RK_GLOBAL|_RK_PRODUCER, "dr_cb", _RK_C_PTR,
 	  _RK(dr_cb),
 	  "Delivery report callback (set with rd_kafka_conf_set_dr_cb())" },
@@ -294,10 +313,8 @@ static const struct rd_kafka_property rd_kafka_properties[] = {
 	  "*1*=broker will wait until the data is written to local "
 	  "log before sending a response, "
 	  "*-1*=broker will block until message is committed by all "
-	  "in sync replicas (ISRs) before sending response. "
-	  "*>1*=for any number > 1 the broker will block waiting for this "
-	  "number of acknowledgements to be received (but the broker "
-	  "will never wait for more acknowledgements than there are ISRs).",
+	  "in sync replicas (ISRs) or broker's `in.sync.replicas` setting before sending response. "
+	  "*1*=Only the leader broker will need to ack the message. ",
 	  -1, 1000, 1 },
         { _RK_TOPIC|_RK_PRODUCER, "enforce.isr.cnt", _RK_C_INT,
           _RKT(enforce_isr_cnt),
@@ -327,7 +344,7 @@ static const struct rd_kafka_property rd_kafka_properties[] = {
           "The application must be use the `dr_msg_cb` to retrieve the offset "
           "from `rd_kafka_message_t.offset`.",
           0, 1, 0 },
-	{ _RK_TOPIC|_RK_PRODUCER, "partitioner", _RK_C_PTR,
+	{ _RK_TOPIC|_RK_PRODUCER, "partitioner_cb", _RK_C_PTR,
 	  _RKT(partitioner),
 	  "Partitioner callback "
 	  "(set with rd_kafka_topic_conf_set_partitioner_cb())" },
@@ -337,6 +354,11 @@ static const struct rd_kafka_property rd_kafka_properties[] = {
 
 
         /* Topic consumer properties */
+        { _RK_TOPIC|_RK_CONSUMER, "group.id", _RK_C_STR,
+          _RKT(group_id_str),
+          "Consumer group id string. All clients sharing the same group.id "
+          "belong to the same consumer group. This takes precedence over "
+          "the global group.id." },
 	{ _RK_TOPIC|_RK_CONSUMER, "auto.commit.enable", _RK_C_BOOL,
 	  _RKT(auto_commit),
 	  "If true, periodically commit offset of the last message handed "
@@ -345,7 +367,8 @@ static const struct rd_kafka_property rd_kafka_properties[] = {
 	  "If false, the application will have to call "
 	  "`rd_kafka_offset_store()` to store an offset (optional). "
 	  "**NOTE:** There is currently no zookeeper integration, offsets "
-	  "will be written to local file according to offset.store.path.",
+	  "will be written to broker or local file according to "
+          "offset.store.method.",
 	  0, 1, 1 },
 	{ _RK_TOPIC|_RK_CONSUMER, "auto.commit.interval.ms", _RK_C_INT,
 	  _RKT(auto_commit_interval_ms),
@@ -393,6 +416,12 @@ static const struct rd_kafka_property rd_kafka_properties[] = {
                         { RD_KAFKA_OFFSET_METHOD_BROKER, "broker" }
                 }
         },
+
+        { _RK_TOPIC|_RK_CONSUMER, "consume.callback.max.messages", _RK_C_INT,
+          _RKT(consume_callback_max_msgs),
+          "Maximum number of messages to dispatch in "
+          "one `rd_kafka_consume_callback*()` call (0 = unlimited)",
+          0, 1000000, 0 },
 
 	{ /* End */ }
 };

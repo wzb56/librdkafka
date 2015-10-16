@@ -40,6 +40,9 @@
 #include <inttypes.h>
 #include <sys/types.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 /**
  * librdkafka version
@@ -52,7 +55,7 @@
  *
  * I.e.: 0x00080100 = 0.8.1
  */
-#define RD_KAFKA_VERSION  0x00080300
+#define RD_KAFKA_VERSION  0x00080600
 
 /**
  * Returns the librdkafka version as integer.
@@ -78,14 +81,14 @@ typedef enum rd_kafka_type_t {
  * Supported debug contexts (CSV "debug" configuration property)
  */
 #define RD_KAFKA_DEBUG_CONTEXTS \
-	"all,generic,broker,topic,metadata,producer,queue,msg"
+	"all,generic,broker,topic,metadata,producer,queue,msg,protocol"
 
 /* Private types to provide ABI compatibility */
 typedef struct rd_kafka_s rd_kafka_t;
 typedef struct rd_kafka_topic_s rd_kafka_topic_t;
 typedef struct rd_kafka_conf_s rd_kafka_conf_t;
 typedef struct rd_kafka_topic_conf_s rd_kafka_topic_conf_t;
-
+typedef struct rd_kafka_queue_s rd_kafka_queue_t;
 
 /**
  * Kafka protocol error codes (version 0.8)
@@ -120,6 +123,7 @@ typedef enum {
 	RD_KAFKA_RESP_ERR__TIMED_OUT = -185,    /* Operation timed out */
 	RD_KAFKA_RESP_ERR__QUEUE_FULL = -184,   /* Queue is full */
         RD_KAFKA_RESP_ERR__ISR_INSUFF = -183,   /* ISR count < required.acks */
+        RD_KAFKA_RESP_ERR__NODE_UPDATE = -182,  /* Broker node update */
 	RD_KAFKA_RESP_ERR__END = -100,       /* end internal error codes */
 
 	/* Standard Kafka errors: */
@@ -136,7 +140,10 @@ typedef enum {
 	RD_KAFKA_RESP_ERR_REPLICA_NOT_AVAILABLE = 9,
 	RD_KAFKA_RESP_ERR_MSG_SIZE_TOO_LARGE = 10,
 	RD_KAFKA_RESP_ERR_STALE_CTRL_EPOCH = 11,
-	RD_KAFKA_RESP_ERR_OFFSET_METADATA_TOO_LARGE = 12
+	RD_KAFKA_RESP_ERR_OFFSET_METADATA_TOO_LARGE = 12,
+	RD_KAFKA_RESP_ERR_OFFSETS_LOAD_IN_PROGRESS = 14,
+	RD_KAFKA_RESP_ERR_CONSUMER_COORDINATOR_NOT_AVAILABLE = 15,
+	RD_KAFKA_RESP_ERR_NOT_COORDINATOR_FOR_CONSUMER = 16
 } rd_kafka_resp_err_t;
 
 
@@ -538,6 +545,16 @@ int32_t rd_kafka_msg_partitioner_random (const rd_kafka_topic_t *rkt,
 					 int32_t partition_cnt,
 					 void *opaque, void *msg_opaque);
 
+/**
+ * Consistent partitioner
+ * Uses consistent hashing to map identical keys onto identical partitions.
+ *
+ * Returns a 'random' partition between 0 and partition_cnt - 1 based on the crc value of the key
+ */
+int32_t rd_kafka_msg_partitioner_consistent (const rd_kafka_topic_t *rkt,
+					 const void *key, size_t keylen,
+					 int32_t partition_cnt,
+					 void *opaque, void *msg_opaque);
 
 
 
@@ -628,6 +645,28 @@ const char *rd_kafka_topic_name (const rd_kafka_topic_t *rkt);
 
 
 
+/*******************************************************************
+ *								   *
+ * Queue API                                                       *
+ *								   *
+ *******************************************************************/
+
+/**
+ * Create a new message queue.
+ * Message queues allows the application to re-route consumed messages
+ * from multiple topic+partitions into one single queue point.
+ * This queue point, containing messages from a number of topic+partitions,
+ * may then be served by a single rd_kafka_consume*_queue() call,
+ * rather than one per topic+partition combination.
+ *
+ * See rd_kafka_consume_start_queue(), rd_kafka_consume_queue(), et.al.
+ */
+rd_kafka_queue_t *rd_kafka_queue_new (rd_kafka_t *rk);
+
+/**
+ * Destroy a queue, purging all of its enqueued messages.
+ */
+void rd_kafka_queue_destroy (rd_kafka_queue_t *rkqu);
 
 
 /*******************************************************************
@@ -644,12 +683,19 @@ const char *rd_kafka_topic_name (const rd_kafka_topic_t *rkt);
 #define RD_KAFKA_OFFSET_STORED -1000  /* Start consuming from offset retrieved
 				       * from offset store */
 
+#define RD_KAFKA_OFFSET_TAIL_BASE -2000 /* internal: do not use */
+
+/* Start consuming `CNT` messages from topic's current `.._END` offset.
+ * That is, if current end offset is 12345 and `CNT` is 200, it will start
+ * consuming from offset 12345-200 = 12145. */
+#define RD_KAFKA_OFFSET_TAIL(CNT)  (RD_KAFKA_OFFSET_TAIL_BASE - (CNT))
 
 /**
  * Start consuming messages for topic 'rkt' and 'partition'
  * at offset 'offset' which may either be a proper offset (0..N)
  * or one of the the special offsets:
- *  `RD_KAFKA_OFFSET_BEGINNING` or `RD_KAFKA_OFFSET_END`.
+ *  `RD_KAFKA_OFFSET_BEGINNING`, `RD_KAFKA_OFFSET_END`,
+ *  `RD_KAFKA_OFFSET_STORED`, `RD_KAFKA_OFFSET_TAIL(..)`
  *
  * rdkafka will attempt to keep 'queued.min.messages' (config property)
  * messages in the local queue by repeatedly fetching batches of messages
@@ -667,6 +713,22 @@ const char *rd_kafka_topic_name (const rd_kafka_topic_t *rkt);
  */
 int rd_kafka_consume_start (rd_kafka_topic_t *rkt, int32_t partition,
 			    int64_t offset);
+
+/**
+ * Same as rd_kafka_consume_start() but re-routes incoming messages to
+ * the provided queue 'rkqu' (which must have been previously allocated
+ * with `rd_kafka_queue_new()`.
+ * The application must use one of the `rd_kafka_consume_*_queue()` functions
+ * to receive fetched messages.
+ *
+ * `rd_kafka_consume_start_queue()` must not be called multiple times for the
+ * same topic and partition without stopping consumption first with
+ * `rd_kafka_consume_stop()`.
+ * `rd_kafka_consume_start()` and `rd_kafka_consume_start_queue()` must not
+ * be combined for the same topic and partition.
+ */
+int rd_kafka_consume_start_queue (rd_kafka_topic_t *rkt, int32_t partition,
+				  int64_t offset, rd_kafka_queue_t *rkqu);
 
 /**
  * Stop consuming messages for topic 'rkt' and 'partition', purging
@@ -695,7 +757,11 @@ int rd_kafka_consume_stop (rd_kafka_topic_t *rkt, int32_t partition);
  *   ENOENT    - 'rkt'+'partition' is unknown.
  *                (no prior `rd_kafka_consume_start()` call)
  *
- * The returned message's '..->err' must be checked for errors.
+ * NOTE: The returned message's '..->err' must be checked for errors.
+ * NOTE: '..->err == RD_KAFKA_RESP_ERR__PARTITION_EOF' signals that the end
+ *       of the partition has been reached, which should typically not be
+ *       considered an error. The application should handle this case
+ *       (e.g., ignore).
  */
 rd_kafka_message_t *rd_kafka_consume (rd_kafka_topic_t *rkt, int32_t partition,
 				      int timeout_ms);
@@ -712,10 +778,17 @@ rd_kafka_message_t *rd_kafka_consume (rd_kafka_topic_t *rkt, int32_t partition,
  *
  * 'timeout_ms' is the maximum amount of time to wait for all of
  * 'rkmessages_size' messages to be put into 'rkmessages'.
+ * If no messages were available within the timeout period this function
+ * returns 0 and `rkmessages` remains untouched.
  * This differs somewhat from `rd_kafka_consume()`.
+ *
+ * The message objects must be destroyed with `rd_kafka_message_destroy()`
+ * when the application is done with it.
  *
  * Returns the number of rkmessages added in 'rkmessages',
  * or -1 on error (same error codes as for `rd_kafka_consume()`.
+ *
+ * See: rd_kafka_consume
  */
 ssize_t rd_kafka_consume_batch (rd_kafka_topic_t *rkt, int32_t partition,
 				int timeout_ms,
@@ -735,12 +808,14 @@ ssize_t rd_kafka_consume_batch (rd_kafka_topic_t *rkt, int32_t partition,
  * to arrive.
  *
  * The provided 'consume_cb' function is called for each message,
- * the application must not call `rd_kafka_message_destroy()` on the provided
+ * the application must NOT call `rd_kafka_message_destroy()` on the provided
  * 'rkmessage'.
  *
  * The 'opaque' argument is passed to the 'consume_cb' as 'opaque'.
  *
  * Returns the number of messages processed or -1 on error.
+ *
+ * See: rd_kafka_consume
  */
 int rd_kafka_consume_callback (rd_kafka_topic_t *rkt, int32_t partition,
 			       int timeout_ms,
@@ -749,6 +824,40 @@ int rd_kafka_consume_callback (rd_kafka_topic_t *rkt, int32_t partition,
 						   void *opaque),
 			       void *opaque);
 
+
+/**
+ * Queue consumers
+ *
+ * The following `..._queue()` functions are analogue to the functions above
+ * but reads messages from the provided queue `rkqu` instead.
+ * `rkqu` must have been previously created with `rd_kafka_queue_new()`
+ * and the topic consumer must have been started with
+ * `rd_kafka_consume_start_queue()` utilising the the same queue.
+ */
+
+/**
+ * See `rd_kafka_consume()` above.
+ */
+rd_kafka_message_t *rd_kafka_consume_queue (rd_kafka_queue_t *rkqu,
+					    int timeout_ms);
+
+/**
+ * See `rd_kafka_consume_batch()` above.
+ */
+ssize_t rd_kafka_consume_batch_queue (rd_kafka_queue_t *rkqu,
+				      int timeout_ms,
+				      rd_kafka_message_t **rkmessages,
+				      size_t rkmessages_size);
+
+/**
+ * See `rd_kafka_consume_callback()` above.
+ */
+int rd_kafka_consume_callback_queue (rd_kafka_queue_t *rkqu,
+				     int timeout_ms,
+				     void (*consume_cb) (rd_kafka_message_t
+							 *rkmessage,
+							 void *opaque),
+				     void *opaque);
 
 
 
@@ -807,6 +916,10 @@ rd_kafka_resp_err_t rd_kafka_offset_store (rd_kafka_topic_t *rkt,
  *                          call returns.
  *
  *    .._F_FREE and .._F_COPY are mutually exclusive.
+ *
+ *    If the function returns -1 and RD_KAFKA_MSG_F_FREE was specified, then
+ *    the memory associated with the payload is still the caller's
+ *    responsibility.
  *
  * 'payload' is the message payload of size 'len' bytes.
  *
@@ -1080,3 +1193,6 @@ int rd_kafka_thread_cnt (void);
 int rd_kafka_wait_destroyed (int timeout_ms);
 
 
+#ifdef __cplusplus
+}
+#endif

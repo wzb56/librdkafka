@@ -124,6 +124,7 @@ struct rd_kafka_conf_s {
 	int     metadata_refresh_interval_ms;
 	int     metadata_refresh_fast_cnt;
 	int     metadata_refresh_fast_interval_ms;
+        int     metadata_refresh_sparse;
 	int     debug;
 	int     broker_addr_ttl;
         int     broker_addr_family;
@@ -135,6 +136,7 @@ struct rd_kafka_conf_s {
 	char   *clientid;
 	char   *brokerlist;
 	int     stats_interval_ms;
+	int     term_sig;
 
 	/*
 	 * Consumer configuration
@@ -163,6 +165,7 @@ struct rd_kafka_conf_s {
 	int    retry_backoff_ms;
 	int    batch_num_messages;
 	rd_kafka_compression_t compression_codec;
+	int    dr_err_only;
 
 	/* Message delivery report callback.
 	 * Called once for each produced message, either on
@@ -241,6 +244,10 @@ struct rd_kafka_topic_conf_s {
 
         int     produce_offset_report;
 
+        char   *group_id_str;
+        rd_kafkap_str_t *group_id;    /* Consumer group id in protocol format */
+
+        int     consume_callback_max_msgs;
 	int     auto_commit;
 	int     auto_commit_interval_ms;
 	int     auto_offset_reset;
@@ -401,13 +408,20 @@ typedef struct rd_kafka_buf_s {
 			   struct rd_kafka_buf_s *reqrkbuf,
 			   void *opaque);
 
+        /* Handler callback: called after response has been parsed.
+         * The arguments are not predefined but varies depending on
+         * response type. */
+        void  (*rkbuf_hndcb) (void *);
+        void   *rkbuf_hndopaque;
+
 	int     rkbuf_refcnt;
 	void   *rkbuf_opaque;
 
 	int     rkbuf_retries;
 
 	rd_ts_t rkbuf_ts_enq;
-	rd_ts_t rkbuf_ts_sent;
+	rd_ts_t rkbuf_ts_sent;    /* Initially: Absolute time of transmission,
+				   * after response: RTT. */
 	rd_ts_t rkbuf_ts_timeout;
 
         int64_t rkbuf_offset;  /* Used by OffsetCommit */
@@ -419,6 +433,7 @@ typedef struct rd_kafka_buf_s {
 typedef struct rd_kafka_bufq_s {
 	TAILQ_HEAD(, rd_kafka_buf_s) rkbq_bufs;
 	int                          rkbq_cnt;
+        int                          rkbq_msg_cnt;
 } rd_kafka_bufq_t;
 
 
@@ -426,6 +441,9 @@ typedef struct rd_kafka_bufq_s {
 typedef struct rd_kafka_q_s {
 	pthread_mutex_t rkq_lock;
 	pthread_cond_t  rkq_cond;
+	struct rd_kafka_q_s *rkq_fwdq; /* Forwarded/Routed queue.
+					* Used in place of this queue
+					* for all operations. */
 	TAILQ_HEAD(, rd_kafka_op_s) rkq_q;
 	int             rkq_qlen;      /* Number of entries in queue */
         uint64_t        rkq_qsize;     /* Size of all entries in queue */
@@ -443,7 +461,8 @@ typedef enum {
 	RD_KAFKA_OP_STATS,    /* Kafka thread -> Application */
 
 	RD_KAFKA_OP_METADATA_REQ, /* any -> Broker thread: request metadata */
-        RD_KAFKA_OP_OFFSET_COMMIT /* any -> toppar's Broker thread */
+        RD_KAFKA_OP_OFFSET_COMMIT,/* any -> toppar's Broker thread */
+        RD_KAFKA_OP_NODE_UPDATE   /* any -> Broker thread: node update */
 } rd_kafka_op_type_t;
 
 typedef struct rd_kafka_op_s {
@@ -487,9 +506,11 @@ typedef struct rd_kafka_op_s {
         struct rd_kafka_toppar_s *rko_rktp;
 #define rko_offset    rko_rkmessage.offset
 
+        /* For BROKER_UPDATE */
+#define rko_nodename  rko_rkmessage.payload
+#define rko_nodeid    rko_rkmessage.partition
+
 } rd_kafka_op_t;
-
-
 
 
 
@@ -500,6 +521,8 @@ typedef enum {
 	RD_KAFKA_LEARNED,
 } rd_kafka_confsource_t;
 
+
+#define RD_KAFKA_NODENAME_SIZE  128
 
 typedef struct rd_kafka_broker_s {
 	TAILQ_ENTRY(rd_kafka_broker_s) rkb_link;
@@ -535,6 +558,7 @@ typedef struct rd_kafka_broker_s {
 		RD_KAFKA_BROKER_STATE_INIT,
 		RD_KAFKA_BROKER_STATE_DOWN,
 		RD_KAFKA_BROKER_STATE_UP,
+                RD_KAFKA_BROKER_STATE_UPDATE,
 	} rkb_state;
 
         rd_ts_t             rkb_ts_state;        /* Timestamp of last
@@ -576,13 +600,14 @@ typedef struct rd_kafka_broker_s {
 	rd_kafka_buf_t     *rkb_recv_buf;
 
 	rd_kafka_bufq_t     rkb_outbufs;
+        int                 rkb_outbuf_msgcnt;
 	rd_kafka_bufq_t     rkb_waitresps;
 	rd_kafka_bufq_t     rkb_retrybufs;
 
 	rd_kafka_avg_t      rkb_avg_rtt;        /* Current averaging period */
 
-	char                rkb_name[128];      /* Display name */
-	char                rkb_nodename[128];  /* host:port */
+	char                rkb_name[RD_KAFKA_NODENAME_SIZE];  /* Displ name */
+	char                rkb_nodename[RD_KAFKA_NODENAME_SIZE]; /* host:port*/
 
 
 } rd_kafka_broker_t;
@@ -660,7 +685,7 @@ typedef struct rd_kafka_toppar_s {
 	} rktp_fetch_state;
 
 	rd_ts_t            rktp_ts_offset_req_next;
-	int64_t            rktp_query_offset;
+	int64_t            rktp_query_offset;    /* Offset to query broker for*/
 	int64_t            rktp_next_offset;     /* Next offset to fetch */
 	int64_t            rktp_app_offset;      /* Last offset delivered to
 						  * application */
@@ -673,6 +698,9 @@ typedef struct rd_kafka_toppar_s {
 						     * commit */
 	int64_t            rktp_eof_offset;      /* The last offset we reported
 						  * EOF for. */
+        int64_t            rktp_lo_offset;       /* Current broker low offset */
+        int64_t            rktp_hi_offset;       /* Current broker hi offset */
+        rd_ts_t            rktp_ts_offset_lag;
 
 	char              *rktp_offset_path;     /* Path to offset file */
 	int                rktp_offset_fd;       /* Offset file fd */
@@ -784,6 +812,7 @@ struct rd_kafka_s {
 #define RD_KAFKA_DBG_PRODUCER   0x10
 #define RD_KAFKA_DBG_QUEUE      0x20
 #define RD_KAFKA_DBG_MSG        0x40
+#define RD_KAFKA_DBG_PROTOCOL   0x80
 #define RD_KAFKA_DBG_ALL        0xff
 
 
@@ -811,7 +840,7 @@ void rd_kafka_log0 (const rd_kafka_t *rk, const char *extra, int level,
 
 void rd_kafka_q_init (rd_kafka_q_t *rkq);
 rd_kafka_q_t *rd_kafka_q_new (void);
-void rd_kafka_q_destroy (rd_kafka_q_t *rkq);
+int rd_kafka_q_destroy (rd_kafka_q_t *rkq);
 #define rd_kafka_q_keep(rkq) ((void)rd_atomic_add(&(rkq)->rkq_refcnt, 1))
 
 /**
@@ -822,40 +851,84 @@ void rd_kafka_q_destroy (rd_kafka_q_t *rkq);
 static inline RD_UNUSED
 void rd_kafka_q_enq (rd_kafka_q_t *rkq, rd_kafka_op_t *rko) {
 	pthread_mutex_lock(&rkq->rkq_lock);
-	TAILQ_INSERT_TAIL(&rkq->rkq_q, rko, rko_link);
-	(void)rd_atomic_add(&rkq->rkq_qlen, 1);
-        (void)rd_atomic_add(&rkq->rkq_qsize, rko->rko_len);
-	pthread_cond_signal(&rkq->rkq_cond);
+	if (!rkq->rkq_fwdq) {
+		TAILQ_INSERT_TAIL(&rkq->rkq_q, rko, rko_link);
+		(void)rd_atomic_add(&rkq->rkq_qlen, 1);
+		(void)rd_atomic_add(&rkq->rkq_qsize, rko->rko_len);
+		pthread_cond_signal(&rkq->rkq_cond);
+	} else
+		rd_kafka_q_enq(rkq->rkq_fwdq, rko);
+
 	pthread_mutex_unlock(&rkq->rkq_lock);
 }
 
 /**
  * Concat all elements of 'srcq' onto tail of 'rkq'.
- * 'dstq' will be be locked, but 'srcq' will not.
+ * 'dstq' will be be locked (if 'do_lock'==1), but 'srcq' will not.
  *
  * Locality: any thread.
  */
 static inline RD_UNUSED
-void rd_kafka_q_concat (rd_kafka_q_t *rkq, rd_kafka_q_t *srcq) {
-	pthread_mutex_lock(&rkq->rkq_lock);
-	TAILQ_CONCAT(&rkq->rkq_q, &srcq->rkq_q, rko_link);
-	(void)rd_atomic_add(&rkq->rkq_qlen, srcq->rkq_qlen);
-        (void)rd_atomic_add(&rkq->rkq_qsize, srcq->rkq_qsize);
-	pthread_cond_signal(&rkq->rkq_cond);
-	pthread_mutex_unlock(&rkq->rkq_lock);
+void rd_kafka_q_concat0 (rd_kafka_q_t *rkq, rd_kafka_q_t *srcq,
+			 int do_lock) {
+	if (do_lock)
+		pthread_mutex_lock(&rkq->rkq_lock);
+	if (!rkq->rkq_fwdq && !srcq->rkq_fwdq) {
+		TAILQ_CONCAT(&rkq->rkq_q, &srcq->rkq_q, rko_link);
+		(void)rd_atomic_add(&rkq->rkq_qlen, srcq->rkq_qlen);
+		(void)rd_atomic_add(&rkq->rkq_qsize, srcq->rkq_qsize);
+		pthread_cond_signal(&rkq->rkq_cond);
+	} else
+		rd_kafka_q_concat0(rkq->rkq_fwdq ? : rkq,
+				   srcq->rkq_fwdq ? : srcq,
+				   rkq->rkq_fwdq ? do_lock : 0);
+	if (do_lock)
+		pthread_mutex_unlock(&rkq->rkq_lock);
 }
 
+#define rd_kafka_q_concat(dstq,srcq) rd_kafka_q_concat0(dstq,srcq,1/*lock*/)
+
+
 /* Returns the number of elements in the queue */
-#define rd_kafka_q_len(rkq)  ((rkq)->rkq_qlen)
+static inline RD_UNUSED
+int rd_kafka_q_len (rd_kafka_q_t *rkq) {
+	int qlen;
+	pthread_mutex_lock(&rkq->rkq_lock);
+	if (!rkq->rkq_fwdq)
+		qlen = rkq->rkq_qlen;
+	else
+		qlen = rd_kafka_q_len(rkq->rkq_fwdq);
+	pthread_mutex_unlock(&rkq->rkq_lock);
+	return qlen;
+}
+
 /* Returns the total size of elements in the queue */
-#define rd_kafka_q_size(rkq) ((rkq)->rkq_qsize)
+static inline RD_UNUSED
+uint64_t rd_kafka_q_size (rd_kafka_q_t *rkq) {
+	uint64_t sz;
+	pthread_mutex_lock(&rkq->rkq_lock);
+	if (!rkq->rkq_fwdq)
+		sz = rkq->rkq_qsize;
+	else
+		sz = rd_kafka_q_size(rkq->rkq_fwdq);
+	pthread_mutex_unlock(&rkq->rkq_lock);
+	return sz;
+}
+
 
 rd_kafka_op_t *rd_kafka_q_pop (rd_kafka_q_t *rkq, int timeout_ms);
 
 void rd_kafka_q_purge (rd_kafka_q_t *rkq);
 
 size_t rd_kafka_q_move_cnt (rd_kafka_q_t *dstq, rd_kafka_q_t *srcq,
-			    size_t cnt);
+			    size_t cnt, int do_locks);
+
+
+struct rd_kafka_queue_s {
+	rd_kafka_q_t rkqu_q;
+};
+
+
 
 
 void rd_kafka_op_destroy (rd_kafka_op_t *rko);

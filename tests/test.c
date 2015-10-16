@@ -35,7 +35,10 @@
 
 
 int test_level = 2;
-int test_seed;
+int test_seed = 0;
+
+static char test_topic_prefix[128] = "rdkafkatest";
+static int  test_topic_random = 0;
 
 static void sig_alarm (int sig) {
 	TEST_FAIL("Test timed out");
@@ -44,6 +47,39 @@ static void sig_alarm (int sig) {
 static void test_error_cb (rd_kafka_t *rk, int err,
 			   const char *reason, void *opaque) {
 	TEST_FAIL("rdkafka error: %s: %s", rd_kafka_err2str(err), reason);
+}
+
+static void test_init (void) {
+	int seed;
+	char *tmp;
+
+	if (test_seed)
+		return;
+
+	if ((tmp = getenv("TEST_LEVEL")))
+		test_level = atoi(tmp);
+	if ((tmp = getenv("TEST_SEED")))
+		seed = atoi(tmp);
+	else
+		seed = test_clock() & 0xffffffff;
+
+	srand(seed);
+	test_seed = seed;
+}
+
+
+const char *test_mk_topic_name (const char *suffix, int randomized) {
+        static __thread char ret[128];
+
+        if (test_topic_random || randomized)
+                snprintf(ret, sizeof(ret), "%s_%"PRIx64"_%s",
+                         test_topic_prefix, test_id_generate(), suffix);
+        else
+                snprintf(ret, sizeof(ret), "%s_%s", test_topic_prefix, suffix);
+
+        TEST_SAY("Using topic \"%s\"\n", ret);
+
+        return ret;
 }
 
 
@@ -58,27 +94,15 @@ void test_conf_init (rd_kafka_conf_t **conf, rd_kafka_topic_conf_t **topic_conf,
 	int line = 0;
 	const char *test_conf = getenv("RDKAFKA_TEST_CONF") ? : "test.conf";
 	char errstr[512];
-	char *tmp;
-	int seed;
 
-	/* Limit the test run time. */
-	alarm(timeout);
-	signal(SIGALRM, sig_alarm);
+	test_init();
 
-	if ((tmp = getenv("TEST_LEVEL")))
-		test_level = atoi(tmp);
-	if ((tmp = getenv("TEST_SEED")))
-		seed = atoi(tmp);
-	else
-		seed = test_clock() & 0xffffffff;
+        if (conf) {
+                *conf = rd_kafka_conf_new();
+                *topic_conf = rd_kafka_topic_conf_new();
 
-	srand(seed);
-        test_seed = seed;
-
-	*conf = rd_kafka_conf_new();
-	*topic_conf = rd_kafka_topic_conf_new();
-
-	rd_kafka_conf_set_error_cb(*conf, test_error_cb);
+                rd_kafka_conf_set_error_cb(*conf, test_error_cb);
+        }
 
 	/* Open and read optional local test configuration file, if any. */
 	if (!(fp = fopen(test_conf, "r"))) {
@@ -92,7 +116,7 @@ void test_conf_init (rd_kafka_conf_t **conf, rd_kafka_topic_conf_t **topic_conf,
 	while (fgets(buf, sizeof(buf)-1, fp)) {
 		char *t;
 		char *b = buf;
-		rd_kafka_conf_res_t res;
+		rd_kafka_conf_res_t res = RD_KAFKA_CONF_UNKNOWN;
 		char *name, *val;
 
 		line++;
@@ -110,15 +134,40 @@ void test_conf_init (rd_kafka_conf_t **conf, rd_kafka_topic_conf_t **topic_conf,
 		*t = '\0';
 		val = t+1;
 
-		if (!strncmp(name, "topic.", strlen("topic."))) {
+                if (!strcmp(name, "test.timeout.multiplier")) {
+                        timeout = (float)timeout * strtod(val, NULL);
+                        res = RD_KAFKA_CONF_OK;
+                } else if (!strcmp(name, "test.topic.prefix")) {
+                        strncpy(test_topic_prefix, val,
+                                sizeof(test_topic_prefix)-1);
+                        res = RD_KAFKA_CONF_OK;
+                } else if (!strcmp(name, "test.topic.random")) {
+                        if (!strcmp(val, "true") ||
+                            !strcmp(val, "1"))
+                                test_topic_random = 1;
+                        else
+                                test_topic_random = 0;
+                        res = RD_KAFKA_CONF_OK;
+                } else if (!strncmp(name, "topic.", strlen("topic."))) {
 			name += strlen("topic.");
-			res = rd_kafka_topic_conf_set(*topic_conf,
-						      name, val,
-						      errstr, sizeof(errstr));
-		} else
-			res = rd_kafka_conf_set(*conf,
-						name, val,
-						errstr, sizeof(errstr));
+                        if (conf)
+                                res = rd_kafka_topic_conf_set(*topic_conf,
+                                                              name, val,
+                                                              errstr,
+                                                              sizeof(errstr));
+                        else
+                                res = RD_KAFKA_CONF_OK;
+                        name -= strlen("topic.");
+                }
+
+                if (res == RD_KAFKA_CONF_UNKNOWN) {
+                        if (conf)
+                                res = rd_kafka_conf_set(*conf,
+                                                        name, val,
+                                                        errstr, sizeof(errstr));
+                        else
+                                res = RD_KAFKA_CONF_OK;
+                }
 
 		if (res != RD_KAFKA_CONF_OK)
 			TEST_FAIL("%s:%i: %s\n",
@@ -126,6 +175,10 @@ void test_conf_init (rd_kafka_conf_t **conf, rd_kafka_topic_conf_t **topic_conf,
 	}
 
 	fclose(fp);
+
+	/* Limit the test run time. */
+	alarm(timeout);
+	signal(SIGALRM, sig_alarm);
 }
 
 
@@ -146,4 +199,13 @@ void test_wait_exit (int timeout) {
 		assert(0);
 		TEST_FAIL("%i thread(s) still active in librdkafka", r);
 	}
+}
+
+
+/**
+ * Generate a "unique" test id.
+ */
+uint64_t test_id_generate (void) {
+	test_init();
+	return (((uint64_t)rand()) << 32) | (uint64_t)rand();
 }

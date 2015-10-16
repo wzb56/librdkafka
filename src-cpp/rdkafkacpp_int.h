@@ -81,21 +81,22 @@ class MessageImpl : public Message {
   ~MessageImpl () {
     if (free_rkmessage_)
       rd_kafka_message_destroy(const_cast<rd_kafka_message_t *>(rkmessage_));
+    delete key_;
   };
 
   MessageImpl (RdKafka::Topic *topic, rd_kafka_message_t *rkmessage):
-      topic_(topic), rkmessage_(rkmessage), free_rkmessage_(true) { }
+      topic_(topic), rkmessage_(rkmessage), free_rkmessage_(true), key_(NULL) { }
 
   MessageImpl (RdKafka::Topic *topic, rd_kafka_message_t *rkmessage,
                bool dofree):
-      topic_(topic), rkmessage_(rkmessage), free_rkmessage_(dofree) { }
+      topic_(topic), rkmessage_(rkmessage), free_rkmessage_(dofree), key_(NULL) { }
 
   MessageImpl (RdKafka::Topic *topic, const rd_kafka_message_t *rkmessage):
-      topic_(topic), rkmessage_(rkmessage), free_rkmessage_(false) { }
+      topic_(topic), rkmessage_(rkmessage), free_rkmessage_(false), key_(NULL) { }
 
   /* Create errored message */
   MessageImpl (RdKafka::Topic *topic, RdKafka::ErrorCode err):
-      topic_(topic), free_rkmessage_(false) {
+      topic_(topic), free_rkmessage_(false), key_(NULL) {
     rkmessage_ = &rkmessage_err_;
     memset(&rkmessage_err_, 0, sizeof(rkmessage_err_));
     rkmessage_err_.err = static_cast<rd_kafka_resp_err_t>(err);
@@ -119,7 +120,18 @@ class MessageImpl : public Message {
   int32_t             partition () const { return rkmessage_->partition; }
   void               *payload () const { return rkmessage_->payload; }
   size_t              len () const { return rkmessage_->len; }
-  const std::string  *key () const { return NULL; /* FIXME */ }
+  const std::string  *key () const {
+    if (key_) {
+      return key_;
+    } else if (rkmessage_->key) {
+      key_ = new std::string(static_cast<char const*>(rkmessage_->key), rkmessage_->key_len);
+      return key_;
+    }
+    return NULL;
+  }
+  const void         *key_pointer () const { return rkmessage_->key; }
+  size_t              key_len () const { return rkmessage_->key_len; }
+
   int64_t             offset () const { return rkmessage_->offset; }
   void               *msg_opaque () const { return rkmessage_->_private; };
 
@@ -129,21 +141,30 @@ class MessageImpl : public Message {
   /* For error signalling by the C++ layer the .._err_ message is
    * used as a place holder and rkmessage_ is set to point to it. */
   rd_kafka_message_t rkmessage_err_;
+  mutable std::string* key_; /* mutable because it's a cached value */
+
+private:
+  /* "delete" copy ctor + copy assignment, for safety of key_ */
+  MessageImpl(MessageImpl const&) /*= delete*/;
+  MessageImpl& operator=(MessageImpl const&) /*= delete*/;
 };
 
 
 class ConfImpl : public Conf {
  public:
   ConfImpl()
-    :dr_cb_(NULL),
-    event_cb_(NULL),
-    socket_cb_(NULL),
-    open_cb_(NULL),
-    partitioner_cb_(NULL){}
+      :dr_cb_(NULL),
+      event_cb_(NULL),
+      socket_cb_(NULL),
+      open_cb_(NULL),
+      partitioner_cb_(NULL),
+      partitioner_kp_cb_(NULL),
+      rk_conf_(NULL),
+      rkt_conf_(NULL){}
   ~ConfImpl () {
     if (rk_conf_)
       rd_kafka_conf_destroy(rk_conf_);
-    else
+    else if (rkt_conf_)
       rd_kafka_topic_conf_destroy(rkt_conf_);
   }
 
@@ -199,6 +220,22 @@ class ConfImpl : public Conf {
     return Conf::CONF_OK;
   }
 
+  Conf::ConfResult set (const std::string &name,
+                        PartitionerKeyPointerCb *partitioner_kp_cb,
+                        std::string &errstr) {
+    if (name != "partitioner_key_pointer_cb") {
+      errstr = "Invalid value type";
+      return Conf::CONF_INVALID;
+    }
+
+    if (!rkt_conf_) {
+      errstr = "Requires RdKafka::Conf::CONF_TOPIC object";
+      return Conf::CONF_INVALID;
+    }
+
+    partitioner_kp_cb_ = partitioner_kp_cb;
+    return Conf::CONF_OK;
+  }
 
   Conf::ConfResult set (const std::string &name, SocketCb *socket_cb,
                         std::string &errstr) {
@@ -241,6 +278,7 @@ class ConfImpl : public Conf {
   SocketCb *socket_cb_;
   OpenCb *open_cb_;
   PartitionerCb *partitioner_cb_;
+  PartitionerKeyPointerCb *partitioner_kp_cb_;
   ConfType conf_type_;
   rd_kafka_conf_t *rk_conf_;
   rd_kafka_topic_conf_t *rkt_conf_;
@@ -268,6 +306,7 @@ class HandleImpl : virtual public Handle {
   OpenCb *open_cb_;
   DeliveryReportCb *dr_cb_;
   PartitionerCb *partitioner_cb_;
+  PartitionerKeyPointerCb *partitioner_kp_cb_;
 };
 
 
@@ -295,6 +334,7 @@ class TopicImpl : public Topic {
 
   rd_kafka_topic_t *rkt_;
   PartitionerCb *partitioner_cb_;
+  PartitionerKeyPointerCb *partitioner_kp_cb_;
 };
 
 
@@ -311,7 +351,8 @@ class ConsumerImpl : virtual public Consumer, virtual public HandleImpl {
   ErrorCode start (Topic *topic, int32_t partition, int64_t offset);
   ErrorCode stop (Topic *topic, int32_t partition);
   Message *consume (Topic *topic, int32_t partition, int timeout_ms);
-
+  int consume_callback (Topic *topic, int32_t partition, int timeout_ms,
+                        ConsumeCb *cb, void *opaque);
 };
 
 
@@ -325,6 +366,12 @@ class ProducerImpl : virtual public Producer, virtual public HandleImpl {
                      int msgflags,
                      void *payload, size_t len,
                      const std::string *key,
+                     void *msg_opaque);
+
+  ErrorCode produce (Topic *topic, int32_t partition,
+                     int msgflags,
+                     void *payload, size_t len,
+                     const void *key, size_t key_len,
                      void *msg_opaque);
 
   static Producer *create (Conf *conf, std::string &errstr);

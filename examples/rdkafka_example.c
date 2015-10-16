@@ -63,7 +63,7 @@ static void stop (int sig) {
 
 static void hexdump (FILE *fp, const char *name, const void *ptr, size_t len) {
 	const char *p = (const char *)ptr;
-	int of = 0;
+	unsigned int of = 0;
 
 
 	if (name)
@@ -126,8 +126,9 @@ static void msg_delivered2 (rd_kafka_t *rk,
                         rd_kafka_message_errstr(rkmessage));
 	else if (!quiet)
 		fprintf(stderr,
-                        "%% Message delivered (%zd bytes, offset %"PRId64")\n",
-                        rkmessage->len, rkmessage->offset);
+                        "%% Message delivered (%zd bytes, offset %"PRId64", "
+                        "partition %"PRId32")\n",
+                        rkmessage->len, rkmessage->offset, rkmessage->partition);
 }
 
 
@@ -153,6 +154,10 @@ static void msg_consume (rd_kafka_message_t *rkmessage,
 		       rkmessage->partition,
 		       rkmessage->offset,
 		       rd_kafka_message_errstr(rkmessage));
+
+                if (rkmessage->err == RD_KAFKA_RESP_ERR__UNKNOWN_PARTITION ||
+                    rkmessage->err == RD_KAFKA_RESP_ERR__UNKNOWN_TOPIC)
+                        run = 0;
 		return;
 	}
 
@@ -255,11 +260,16 @@ int main (int argc, char **argv) {
 	int64_t start_offset = 0;
         int report_offsets = 0;
 	int do_conf_dump = 0;
+	char tmp[16];
 
 	quiet = !isatty(STDIN_FILENO);
 
 	/* Kafka configuration */
 	conf = rd_kafka_conf_new();
+
+	/* Quick termination */
+	snprintf(tmp, sizeof(tmp), "%i", SIGIO);
+	rd_kafka_conf_set(conf, "internal.termination.signal", tmp, NULL, 0);
 
 	/* Topic configuration */
 	topic_conf = rd_kafka_topic_conf_new();
@@ -298,8 +308,12 @@ int main (int argc, char **argv) {
 				start_offset = RD_KAFKA_OFFSET_STORED;
                         else if (!strcmp(optarg, "report"))
                                 report_offsets = 1;
-			else
+			else {
 				start_offset = strtoll(optarg, NULL, 10);
+
+				if (start_offset < 0)
+					start_offset = RD_KAFKA_OFFSET_TAIL(-start_offset);
+			}
 			break;
 		case 'e':
 			exit_eof = 1;
@@ -414,14 +428,15 @@ int main (int argc, char **argv) {
 			"  -b <brokers>    Broker address (localhost:9092)\n"
 			"  -z <codec>      Enable compression:\n"
 			"                  none|gzip|snappy\n"
-			"  -o <offset>     Start offset (consumer)\n"
+			"  -o <offset>     Start offset (consumer):\n"
+			"                  beginning, end, NNNNN or -NNNNN\n"
                         "  -o report       Report message offsets (producer)\n"
 			"  -e              Exit consumer when last message\n"
 			"                  in partition has been received.\n"
 			"  -d [facs..]     Enable debugging contexts:\n"
+			"                  %s\n"
 			"  -q              Be quiet\n"
 			"  -A              Raw payload output (consumer)\n"
-			"                  %s\n"
 			"  -X <prop=name> Set arbitrary librdkafka "
 			"configuration property\n"
 			"               Properties prefixed with \"topic.\" "
@@ -547,6 +562,9 @@ int main (int argc, char **argv) {
 		while (run && rd_kafka_outq_len(rk) > 0)
 			rd_kafka_poll(rk, 100);
 
+		/* Destroy topic */
+		rd_kafka_topic_destroy(rkt);
+
 		/* Destroy the handle */
 		rd_kafka_destroy(rk);
 
@@ -603,8 +621,10 @@ int main (int argc, char **argv) {
 		/* Stop consuming */
 		rd_kafka_consume_stop(rkt, partition);
 
+		/* Destroy topic */
 		rd_kafka_topic_destroy(rkt);
 
+		/* Destroy handle */
 		rd_kafka_destroy(rk);
 
         } else if (mode == 'L') {
@@ -654,6 +674,10 @@ int main (int argc, char **argv) {
                         rd_kafka_metadata_destroy(metadata);
                         run = 0;
                 }
+
+		/* Destroy topic */
+		if (rkt)
+			rd_kafka_topic_destroy(rkt);
 
 		/* Destroy the handle */
 		rd_kafka_destroy(rk);

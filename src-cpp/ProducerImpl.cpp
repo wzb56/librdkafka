@@ -54,6 +54,7 @@ RdKafka::Producer *RdKafka::Producer::create (RdKafka::Conf *conf,
   char errbuf[512];
   RdKafka::ConfImpl *confimpl = dynamic_cast<RdKafka::ConfImpl *>(conf);
   RdKafka::ProducerImpl *rkp = new RdKafka::ProducerImpl();
+  rd_kafka_conf_t *rk_conf = NULL;
 
   if (confimpl) {
     if (!confimpl->rk_conf_) {
@@ -64,16 +65,17 @@ RdKafka::Producer *RdKafka::Producer::create (RdKafka::Conf *conf,
 
     rkp->set_common_config(confimpl);
 
+    rk_conf = rd_kafka_conf_dup(confimpl->rk_conf_);
+
     if (confimpl->dr_cb_) {
-      rd_kafka_conf_set_dr_msg_cb(confimpl->rk_conf_, dr_msg_cb_trampoline);
+      rd_kafka_conf_set_dr_msg_cb(rk_conf, dr_msg_cb_trampoline);
       rkp->dr_cb_ = confimpl->dr_cb_;
     }
   }
 
 
   rd_kafka_t *rk;
-  if (!(rk = rd_kafka_new(RD_KAFKA_PRODUCER,
-                          confimpl ? confimpl->rk_conf_ : NULL,
+  if (!(rk = rd_kafka_new(RD_KAFKA_PRODUCER, rk_conf,
                           errbuf, sizeof(errbuf)))) {
     errstr = errbuf;
     delete rkp;
@@ -101,6 +103,24 @@ RdKafka::ErrorCode RdKafka::ProducerImpl::produce (RdKafka::Topic *topic,
   if (rd_kafka_produce(topicimpl->rkt_, partition, msgflags,
                        payload, len,
                        key ? key->c_str() : NULL, key ? key->size() : 0,
+                       msg_opaque) == -1)
+    return static_cast<RdKafka::ErrorCode>(rd_kafka_errno2err(errno));
+
+  return RdKafka::ERR_NO_ERROR;
+}
+
+
+RdKafka::ErrorCode RdKafka::ProducerImpl::produce (RdKafka::Topic *topic,
+                                                   int32_t partition,
+                                                   int msgflags,
+                                                   void *payload, size_t len,
+                                                   const void *key,
+                                                   size_t key_len,
+                                                   void *msg_opaque) {
+  RdKafka::TopicImpl *topicimpl = dynamic_cast<RdKafka::TopicImpl *>(topic);
+
+  if (rd_kafka_produce(topicimpl->rkt_, partition, msgflags,
+                       payload, len, key, key_len,
                        msg_opaque) == -1)
     return static_cast<RdKafka::ErrorCode>(rd_kafka_errno2err(errno));
 
